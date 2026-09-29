@@ -1,4 +1,4 @@
-# DebateHub
+# Debate Hub
 
 React + Vite + Ably (real-time) wrapped with Capacitor to build an Android APK via GitHub Actions.
 
