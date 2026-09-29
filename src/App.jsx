@@ -1,6 +1,10 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Users, User, PlusCircle, Search, Send, X, ArrowLeft, ThumbsUp, Wifi, WifiOff } from 'lucide-react';
-import { createBus } from './realtime.js';
+import * as Ably from 'ably';
+import { AblyProvider, ChannelProvider, useChannel, useConnectionStateListener } from 'ably/react';
+
+const ABLY_KEY = 'N_STWA.0HRHUA:ed6TEW7mZP2xSGvPkkvzsZSuVQW769iX-8C5ale-X68';
+const CHANNEL_NAME = 'debatehub:main';
 
 const CATEGORIES = ['All', 'Politics', 'Technology', 'Science', 'Philosophy', 'Sports'];
 
@@ -53,11 +57,11 @@ const INITIAL_DEBATES = [
 function applyEvent(debates, { name, data }) {
   if (!data) return debates;
   switch (name) {
-    case 'debate:create': {
+    case 'new_debate': {
       if (debates.some((d) => d.id === data.id)) return debates;
       return [{ ...data, participants: [data.creator], status: 'open', messages: [] }, ...debates];
     }
-    case 'debate:join': {
+    case 'join_debate': {
       return debates.map((d) => {
         if (d.id !== data.debateId || d.participants.includes(data.user)) return d;
         if (d.type === '1v1' && d.participants.length >= 2) return d;
@@ -65,13 +69,13 @@ function applyEvent(debates, { name, data }) {
         return { ...d, participants, status: d.type === '1v1' && participants.length >= 2 ? 'accepted' : 'open' };
       });
     }
-    case 'message:new': {
+    case 'new_argument': {
       return debates.map((d) => {
         if (d.id !== data.debateId || d.messages.some((m) => m.id === data.message.id)) return d;
         return { ...d, messages: [...d.messages, { ...data.message, upvotes: 0, voters: [] }] };
       });
     }
-    case 'message:vote': {
+    case 'vote_argument': {
       return debates.map((d) =>
         d.id !== data.debateId
           ? d
@@ -94,11 +98,7 @@ function applyEvent(debates, { name, data }) {
 
 const voteCount = (m) => m.upvotes + m.voters.length;
 
-export default function DebatePlatform() {
-  const [username, setUsername] = useState(() => {
-    try { return localStorage.getItem('debatehub:name') || ''; } catch { return ''; }
-  });
-  const [nameInput, setNameInput] = useState('');
+function DebatePlatform({ username }) {
   const [status, setStatus] = useState('connecting');
 
   const [debates, setDebates] = useState(INITIAL_DEBATES);
@@ -118,18 +118,19 @@ export default function DebatePlatform() {
   const [chatMessage, setChatMessage] = useState('');
   const [chatStance, setChatStance] = useState('Pro');
   const messagesEndRef = useRef(null);
-  const busRef = useRef(null);
 
-  const onEvent = useCallback((evt) => setDebates((prev) => applyEvent(prev, evt)), []);
+  // Live connection: every event (including our own, echoed back by Ably) updates state
+  const { channel } = useChannel(CHANNEL_NAME, (message) => {
+    setDebates((prev) => applyEvent(prev, { name: message.name, data: message.data }));
+  });
 
-  useEffect(() => {
-    if (!username) return undefined;
-    const bus = createBus(username, onEvent, setStatus);
-    busRef.current = bus;
-    return () => { bus.close(); busRef.current = null; };
-  }, [username, onEvent]);
+  useConnectionStateListener((change) => {
+    setStatus(change.current === 'connected' ? 'online' : change.current);
+  });
 
-  const publish = (name, data) => busRef.current && busRef.current.publish(name, data);
+  const publish = (name, data) => {
+    channel.publish(name, data).catch(() => setStatus('error'));
+  };
 
   const query = searchQuery.trim().toLowerCase();
   const filteredDebates = debates.filter((d) => {
@@ -155,14 +156,7 @@ export default function DebatePlatform() {
     return { hasData: true, proPct, conPct: 100 - proPct };
   };
 
-  const handleSaveName = () => {
-    const n = nameInput.trim().slice(0, 20);
-    if (!n) return;
-    try { localStorage.setItem('debatehub:name', n); } catch { /* ignore */ }
-    setUsername(n);
-  };
-
-  const handleAcceptDebate = (id) => publish('debate:join', { debateId: id, user: username });
+  const handleAcceptDebate = (id) => publish('join_debate', { debateId: id, user: username });
 
   const closeModal = () => { setShowCreateModal(false); setFormError(''); };
 
@@ -171,7 +165,7 @@ export default function DebatePlatform() {
       setFormError('Please fill in both the title and description.');
       return;
     }
-    publish('debate:create', {
+    publish('new_debate', {
       id: Date.now() + Math.floor(Math.random() * 1000),
       title: newTitle.trim(),
       category: newCategory,
@@ -186,7 +180,7 @@ export default function DebatePlatform() {
 
   const handleSendMessage = () => {
     if (!chatMessage.trim() || !activeDebate || !isJoined) return;
-    publish('message:new', {
+    publish('new_argument', {
       debateId: activeDebateId,
       message: {
         id: Date.now() + Math.floor(Math.random() * 1000),
@@ -199,7 +193,7 @@ export default function DebatePlatform() {
   };
 
   const handleUpvote = (msg) => {
-    publish('message:vote', {
+    publish('vote_argument', {
       debateId: activeDebateId,
       messageId: msg.id,
       user: username,
@@ -221,38 +215,10 @@ export default function DebatePlatform() {
     color: '#0f172a',
   };
 
-  /* ---------- Name prompt ---------- */
-  if (!username) {
-    return (
-      <div style={{ ...pageStyle, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ width: '100%', maxWidth: '380px', backgroundColor: 'white', padding: '24px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-          <h1 style={{ margin: '0 0 4px 0', fontSize: '26px' }}>DebateHub</h1>
-          <p style={{ margin: '0 0 16px 0', color: '#64748b', fontSize: '14px' }}>Pick a display name. Others will see it next to your arguments.</p>
-          <input
-            style={inputStyle}
-            placeholder="Your name"
-            maxLength={20}
-            value={nameInput}
-            onChange={(e) => setNameInput(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && handleSaveName()}
-            autoFocus
-          />
-          <button
-            onClick={handleSaveName}
-            disabled={!nameInput.trim()}
-            style={{ marginTop: '12px', width: '100%', backgroundColor: nameInput.trim() ? '#2563eb' : '#93c5fd', color: 'white', border: 'none', padding: '12px', borderRadius: '8px', fontWeight: 'bold', fontSize: '15px', cursor: nameInput.trim() ? 'pointer' : 'not-allowed' }}
-          >
-            Start debating
-          </button>
-        </div>
-      </div>
-    );
-  }
-
   const StatusPill = () => (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '11px', fontWeight: 'bold', color: status === 'online' ? '#166534' : '#92400e' }}>
       {status === 'online' ? <Wifi size={12} /> : <WifiOff size={12} />}
-      {status === 'online' ? 'Live' : status === 'offline' ? 'Local only' : 'Connecting…'}
+      {status === 'online' ? 'Live' : status === 'connecting' || status === 'initialized' ? 'Connecting…' : 'Reconnecting…'}
     </span>
   );
 
@@ -557,6 +523,62 @@ export default function DebatePlatform() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+
+/* ---------- Ably wiring ---------- */
+function LiveApp({ username }) {
+  const [client] = useState(() => new Ably.Realtime({ key: ABLY_KEY, clientId: username }));
+  useEffect(() => () => client.close(), [client]);
+
+  return (
+    <AblyProvider client={client}>
+      <ChannelProvider channelName={CHANNEL_NAME} options={{ params: { rewind: '200' } }}>
+        <DebatePlatform username={username} />
+      </ChannelProvider>
+    </AblyProvider>
+  );
+}
+
+export default function App() {
+  const [username, setUsername] = useState(() => {
+    try { return localStorage.getItem('debatehub:name') || ''; } catch { return ''; }
+  });
+  const [nameInput, setNameInput] = useState('');
+
+  const save = () => {
+    const n = nameInput.trim().slice(0, 20);
+    if (!n) return;
+    try { localStorage.setItem('debatehub:name', n); } catch { /* ignore */ }
+    setUsername(n);
+  };
+
+  if (username) return <LiveApp username={username} />;
+
+  return (
+    <div style={{ fontFamily: 'system-ui, sans-serif', backgroundColor: '#f8fafc', minHeight: '100vh', padding: '24px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ width: '100%', maxWidth: '380px', backgroundColor: 'white', padding: '24px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
+        <h1 style={{ margin: '0 0 4px 0', fontSize: '26px' }}>DebateHub</h1>
+        <p style={{ margin: '0 0 16px 0', color: '#64748b', fontSize: '14px' }}>Pick a display name. Others will see it next to your arguments.</p>
+        <input
+          style={{ padding: '10px', borderRadius: '6px', border: '1px solid #d1d5db', fontSize: '16px', width: '100%', boxSizing: 'border-box' }}
+          placeholder="Your name"
+          maxLength={20}
+          value={nameInput}
+          onChange={(e) => setNameInput(e.target.value)}
+          onKeyDown={(e) => e.key === 'Enter' && save()}
+          autoFocus
+        />
+        <button
+          onClick={save}
+          disabled={!nameInput.trim()}
+          style={{ marginTop: '12px', width: '100%', backgroundColor: nameInput.trim() ? '#2563eb' : '#93c5fd', color: 'white', border: 'none', padding: '12px', borderRadius: '8px', fontWeight: 'bold', fontSize: '15px', cursor: nameInput.trim() ? 'pointer' : 'not-allowed' }}
+        >
+          Start debating
+        </button>
+      </div>
     </div>
   );
 }
