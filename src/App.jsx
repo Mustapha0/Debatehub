@@ -1,10 +1,14 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
-import { Users, User, PlusCircle, Search, Send, X, ArrowLeft, ThumbsUp, Wifi, WifiOff } from 'lucide-react';
+import { Users, User, PlusCircle, Search, Send, X, ArrowLeft, ThumbsUp, Wifi, WifiOff, Bell, BellOff, Facebook } from 'lucide-react';
+import { LocalNotifications } from '@capacitor/local-notifications';
 import * as Ably from 'ably';
-import { AblyProvider, ChannelProvider, useChannel, useConnectionStateListener } from 'ably/react';
+import { AblyProvider, ChannelProvider, useChannel, useConnectionStateListener, usePresence, usePresenceListener } from 'ably/react';
 
 const ABLY_KEY = 'N_STWA.0HRHUA:ed6TEW7mZP2xSGvPkkvzsZSuVQW769iX-8C5ale-X68';
 const CHANNEL_NAME = 'debatehub:main';
+const FACEBOOK_URL = 'https://www.facebook.com/Factsbyexperiences';
+const LOGO = `${import.meta.env.BASE_URL}logo.png`;
+const LIVE_WINDOW_MS = 10 * 60 * 1000; // a debate counts as live if active in the last 10 minutes
 
 const CATEGORIES = ['All', 'Politics', 'Technology', 'Science', 'Philosophy', 'Sports'];
 
@@ -54,25 +58,25 @@ const INITIAL_DEBATES = [
 ];
 
 /* ---------- Shared-state reducer: every device applies the same events ---------- */
-function applyEvent(debates, { name, data }) {
+function applyEvent(debates, { name, data, ts }) {
   if (!data) return debates;
   switch (name) {
     case 'new_debate': {
       if (debates.some((d) => d.id === data.id)) return debates;
-      return [{ ...data, participants: [data.creator], status: 'open', messages: [] }, ...debates];
+      return [{ ...data, participants: [data.creator], status: 'open', messages: [], lastActivity: ts }, ...debates];
     }
     case 'join_debate': {
       return debates.map((d) => {
         if (d.id !== data.debateId || d.participants.includes(data.user)) return d;
         if (d.type === '1v1' && d.participants.length >= 2) return d;
         const participants = [...d.participants, data.user];
-        return { ...d, participants, status: d.type === '1v1' && participants.length >= 2 ? 'accepted' : 'open' };
+        return { ...d, participants, lastActivity: ts, status: d.type === '1v1' && participants.length >= 2 ? 'accepted' : 'open' };
       });
     }
     case 'new_argument': {
       return debates.map((d) => {
         if (d.id !== data.debateId || d.messages.some((m) => m.id === data.message.id)) return d;
-        return { ...d, messages: [...d.messages, { ...data.message, upvotes: 0, voters: [] }] };
+        return { ...d, lastActivity: ts, messages: [...d.messages, { ...data.message, upvotes: 0, voters: [] }] };
       });
     }
     case 'vote_argument': {
@@ -98,6 +102,43 @@ function applyEvent(debates, { name, data }) {
 
 const voteCount = (m) => m.upvotes + m.voters.length;
 
+/* ---------- Notifications (native on Android, web fallback in browsers) ---------- */
+let channelReady = false;
+async function requestNotifPermission() {
+  try {
+    const res = await LocalNotifications.requestPermissions();
+    if (res.display === 'granted' && !channelReady) {
+      channelReady = true;
+      await LocalNotifications.createChannel({ id: 'debates', name: 'Debate messages', importance: 4 }).catch(() => {});
+    }
+  } catch {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') Notification.requestPermission();
+  }
+}
+async function notify(title, body) {
+  const text = body.length > 140 ? `${body.slice(0, 137)}...` : body;
+  try {
+    await LocalNotifications.schedule({
+      notifications: [{ id: Math.floor(Math.random() * 2147483000), title, body: text, channelId: 'debates' }],
+    });
+  } catch {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') new Notification(title, { body: text });
+  }
+}
+
+function FacebookLink() {
+  return (
+    <a
+      href={FACEBOOK_URL}
+      target="_blank"
+      rel="noopener noreferrer"
+      style={{ display: 'inline-flex', alignItems: 'center', gap: 6, color: '#1d4ed8', fontWeight: 600, fontSize: '14px', textDecoration: 'none' }}
+    >
+      <Facebook size={16} /> Follow Facts by Experiences on Facebook
+    </a>
+  );
+}
+
 function DebatePlatform({ username }) {
   const [status, setStatus] = useState('connecting');
 
@@ -119,10 +160,64 @@ function DebatePlatform({ username }) {
   const [chatStance, setChatStance] = useState('Pro');
   const messagesEndRef = useRef(null);
 
+  // Refs so the live callback always sees current values
+  const debatesRef = useRef(debates);
+  const activeIdRef = useRef(null);
+  const notifRef = useRef(true);
+  useEffect(() => { debatesRef.current = debates; }, [debates]);
+  useEffect(() => { activeIdRef.current = activeDebateId; }, [activeDebateId]);
+
+  const [notifOn, setNotifOn] = useState(() => {
+    try { return localStorage.getItem('debatehub:notif') !== 'off'; } catch { return true; }
+  });
+  useEffect(() => {
+    notifRef.current = notifOn;
+    try { localStorage.setItem('debatehub:notif', notifOn ? 'on' : 'off'); } catch { /* ignore */ }
+    if (notifOn) requestNotifPermission();
+  }, [notifOn]);
+
   // Live connection: every event (including our own, echoed back by Ably) updates state
   const { channel } = useChannel(CHANNEL_NAME, (message) => {
-    setDebates((prev) => applyEvent(prev, { name: message.name, data: message.data }));
+    const { name, data } = message;
+    const ts = message.timestamp || Date.now();
+
+    // Notify participants of activity from the other side (skip replayed history and our own actions)
+    if (data && notifRef.current && Date.now() - ts < 30000) {
+      const d = debatesRef.current.find((x) => x.id === data.debateId);
+      const viewing = document.visibilityState === 'visible' && activeIdRef.current === data.debateId;
+      if (d && d.participants.includes(username) && !viewing) {
+        if (name === 'new_argument' && data.message.author !== username) {
+          notify(d.title, `${data.message.author} (${data.message.stance}): ${data.message.text}`);
+        } else if (name === 'join_debate' && data.user !== username) {
+          notify(d.title, `${data.user} joined the debate`);
+        }
+      }
+    }
+
+    setDebates((prev) => applyEvent(prev, { name, data, ts }));
   });
+
+  // Presence: who is currently watching which debate
+  const { updateStatus } = usePresence(CHANNEL_NAME, { initialData: { debateId: null } });
+  const { presenceData } = usePresenceListener(CHANNEL_NAME);
+  useEffect(() => {
+    try { updateStatus({ debateId: activeDebateId }); } catch { /* not attached yet */ }
+  }, [activeDebateId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const i = setInterval(() => setNow(Date.now()), 30000);
+    return () => clearInterval(i);
+  }, []);
+
+  const viewers = {};
+  presenceData.forEach((p) => {
+    const id = p.data && p.data.debateId;
+    if (id !== null && id !== undefined) viewers[id] = (viewers[id] || 0) + 1;
+  });
+  const onlineCount = presenceData.length;
+  const isLive = (d) => (viewers[d.id] || 0) > 0 || (d.lastActivity && now - d.lastActivity < LIVE_WINDOW_MS);
+  const liveDebates = debates.filter(isLive).sort((a, b) => (viewers[b.id] || 0) - (viewers[a.id] || 0));
 
   useConnectionStateListener((change) => {
     setStatus(change.current === 'connected' ? 'online' : change.current);
@@ -369,18 +464,73 @@ function DebatePlatform({ username }) {
         <div style={{ maxWidth: '1100px', margin: '0 auto' }}>
           <header style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px', flexWrap: 'wrap', gap: 16 }}>
             <div>
-              <h1 style={{ margin: 0, fontSize: '28px', fontWeight: 'bold' }}>DebateHub</h1>
+              <h1 style={{ margin: 0, fontSize: '28px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: 10 }}>
+                <img src={LOGO} alt="" width={40} height={40} style={{ borderRadius: '50%' }} /> Debate Hub
+              </h1>
               <p style={{ margin: '4px 0 0 0', color: '#64748b' }}>
                 Signed in as <strong>{username}</strong> · <StatusPill />
               </p>
             </div>
+            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button
+              onClick={() => setNotifOn((v) => !v)}
+              aria-pressed={notifOn}
+              aria-label={notifOn ? 'Turn notifications off' : 'Turn notifications on'}
+              style={{ display: 'flex', alignItems: 'center', gap: 6, backgroundColor: notifOn ? '#dbeafe' : '#e2e8f0', color: notifOn ? '#1e40af' : '#475569', border: 'none', padding: '10px 12px', borderRadius: '8px', cursor: 'pointer', fontWeight: 600, fontSize: '13px' }}
+            >
+              {notifOn ? <Bell size={16} /> : <BellOff size={16} />} {notifOn ? 'On' : 'Off'}
+            </button>
             <button
               onClick={() => setShowCreateModal(true)}
               style={{ display: 'flex', alignItems: 'center', gap: '8px', backgroundColor: '#2563eb', color: 'white', padding: '10px 18px', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: '600' }}
             >
               <PlusCircle size={18} /> Create Debate
             </button>
+            </div>
           </header>
+
+          <section style={{ marginBottom: '24px' }}>
+            <h2 style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: '18px', margin: '0 0 12px 0' }}>
+              <span style={{ width: 10, height: 10, borderRadius: '50%', backgroundColor: '#ef4444' }} /> Live now
+              <span style={{ fontSize: '12px', color: '#64748b', fontWeight: 'normal' }}>{onlineCount} online</span>
+            </h2>
+            {liveDebates.length === 0 ? (
+              <div style={{ padding: '16px', backgroundColor: 'white', borderRadius: '8px', border: '1px solid #e2e8f0', color: '#64748b', fontSize: '14px' }}>
+                No debates are live right now. Start one and others can join.
+              </div>
+            ) : (
+              <div style={{ display: 'flex', gap: '12px', overflowX: 'auto', paddingBottom: '4px' }}>
+                {liveDebates.map((d) => {
+                  const joined = d.participants.includes(username);
+                  const full = d.status === 'accepted';
+                  return (
+                    <div key={d.id} style={{ flex: '0 0 260px', backgroundColor: 'white', borderRadius: '12px', padding: '14px', border: '1px solid #fecaca', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      <div style={{ fontWeight: 'bold', fontSize: '15px' }}>{d.title}</div>
+                      <div style={{ fontSize: '12px', color: '#64748b' }}>
+                        {viewers[d.id] || 0} watching • {d.messages.length} arguments • {d.type}
+                      </div>
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button
+                          onClick={() => setActiveDebateId(d.id)}
+                          style={{ flex: 1, backgroundColor: '#f1f5f9', border: '1px solid #e2e8f0', padding: '8px', borderRadius: '6px', cursor: 'pointer', fontWeight: 600 }}
+                        >
+                          Watch
+                        </button>
+                        {!joined && !full && (
+                          <button
+                            onClick={() => { handleAcceptDebate(d.id); setActiveDebateId(d.id); }}
+                            style={{ flex: 1, backgroundColor: '#16a34a', color: 'white', border: 'none', padding: '8px', borderRadius: '6px', cursor: 'pointer', fontWeight: 600 }}
+                          >
+                            Join
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
 
           <div style={{ display: 'flex', gap: '16px', marginBottom: '24px', flexWrap: 'wrap', alignItems: 'center' }}>
             <div style={{ position: 'relative', flex: '1 1 280px' }}>
@@ -463,6 +613,7 @@ function DebatePlatform({ username }) {
               })
             )}
           </div>
+          <div style={{ textAlign: 'center', marginTop: '32px' }}><FacebookLink /></div>
         </div>
       )}
 
@@ -560,7 +711,10 @@ export default function App() {
   return (
     <div style={{ fontFamily: 'system-ui, sans-serif', backgroundColor: '#f8fafc', minHeight: '100vh', padding: '24px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
       <div style={{ width: '100%', maxWidth: '380px', backgroundColor: 'white', padding: '24px', borderRadius: '12px', border: '1px solid #e2e8f0' }}>
-        <h1 style={{ margin: '0 0 4px 0', fontSize: '26px' }}>DebateHub</h1>
+        <div style={{ textAlign: 'center', marginBottom: 12 }}>
+          <img src={LOGO} alt="Debate Hub" width={96} height={96} style={{ borderRadius: '50%' }} />
+        </div>
+        <h1 style={{ margin: '0 0 4px 0', fontSize: '26px', textAlign: 'center' }}>Debate Hub</h1>
         <p style={{ margin: '0 0 16px 0', color: '#64748b', fontSize: '14px' }}>Pick a display name. Others will see it next to your arguments.</p>
         <input
           style={{ padding: '10px', borderRadius: '6px', border: '1px solid #d1d5db', fontSize: '16px', width: '100%', boxSizing: 'border-box' }}
@@ -578,6 +732,7 @@ export default function App() {
         >
           Start debating
         </button>
+        <div style={{ textAlign: 'center', marginTop: 16 }}><FacebookLink /></div>
       </div>
     </div>
   );
