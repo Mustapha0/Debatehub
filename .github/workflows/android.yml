@@ -20,6 +20,29 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      - name: Prepare logo and icons
+        run: |
+          pip install pillow
+          mkdir -p public assets
+          python3 - <<'PY'
+          from PIL import Image, ImageDraw
+          im = Image.open('logo.png').convert('RGBA')
+          cx, cy, r = 621, 612, 553
+          crop = im.crop((cx-r, cy-r, cx+r, cy+r))
+          mask = Image.new('L', crop.size, 0)
+          ImageDraw.Draw(mask).ellipse((0, 0, crop.size[0]-1, crop.size[1]-1), fill=255)
+          circ = Image.new('RGBA', crop.size, (0, 0, 0, 0))
+          circ.paste(crop, (0, 0), mask)
+          circ.resize((512, 512), Image.LANCZOS).save('public/logo.png')
+          im.resize((1024, 1024), Image.LANCZOS).convert('RGB').save('assets/icon-only.png')
+          fg = Image.new('RGBA', (1024, 1024), (0, 0, 0, 0))
+          s = int(1024 * 0.64)
+          c = circ.resize((s, s), Image.LANCZOS)
+          fg.paste(c, ((1024 - s) // 2, (1024 - s) // 2), c)
+          fg.save('assets/icon-foreground.png')
+          Image.new('RGB', (1024, 1024), (5, 10, 26)).save('assets/icon-background.png')
+          PY
+
       - name: Install dependencies
         run: npm install
 
@@ -29,6 +52,8 @@ jobs:
       - name: Add and sync Android project
         run: |
           npx cap add android
+          npx @capacitor/assets generate --android --iconBackgroundColor '#050a1a' --iconBackgroundColorDark '#050a1a'
+          sed -i 's#</manifest>#    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n</manifest>#' android/app/src/main/AndroidManifest.xml
           npx cap sync android
 
       - name: Build debug APK
