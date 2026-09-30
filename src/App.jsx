@@ -1,15 +1,13 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Users, User, PlusCircle, Search, Send, X, ArrowLeft, ThumbsUp, Wifi, WifiOff, Bell, BellOff, Facebook } from 'lucide-react';
 import { LocalNotifications } from '@capacitor/local-notifications';
-import * as Ably from 'ably';
-import { AblyProvider, ChannelProvider, useChannel, useConnectionStateListener, usePresence, usePresenceListener } from 'ably/react';
 import { createClient } from '@supabase/supabase-js';
 
-const SUPABASE_URL = 'https://pqwwxmmqumvmjonlreld.supabase.co';
-const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxd3d4bW1xdW12bWpvbmxyZWxkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA3NTE4MzcsImV4cCI6MjEwNjMyNzgzN30._Lg0q4frcQkj_n83ftvufIWIskC56UcLRg2VvXg56tY';
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Set VITE_SUPABASE_URL / VITE_SUPABASE_ANON_KEY in .env.local (see .env.example). The fallbacks keep GitHub builds working.
+const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL || 'https://pqwwxmmqumvmjonlreld.supabase.co';
+const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxd3d4bW1xdW12bWpvbmxyZWxkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA3NTE4MzcsImV4cCI6MjEwNjMyNzgzN30._Lg0q4frcQkj_n83ftvufIWIskC56UcLRg2VvXg56tY';
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { realtime: { params: { eventsPerSecond: 10 } } });
 
-const ABLY_KEY = 'N_STWA.0HRHUA:ed6TEW7mZP2xSGvPkkvzsZSuVQW769iX-8C5ale-X68';
 const CHANNEL_NAME = 'debatehub:main';
 const FACEBOOK_URL = 'https://www.facebook.com/Factsbyexperiences';
 const LOGO = `${import.meta.env.BASE_URL}logo.png`;
@@ -23,7 +21,7 @@ function applyEvent(debates, { name, data, ts }) {
   switch (name) {
     case 'new_debate': {
       if (debates.some((d) => d.id === data.id)) return debates;
-      return [{ ...data, participants: [data.creator], status: 'open', messages: [], lastActivity: ts }, ...debates];
+      return [{ ...data, participants: [data.creator], status: 'open', messages: [], messagesLoaded: true, messageCount: 0, pendingMessages: [], lastActivity: ts }, ...debates];
     }
     case 'join_debate': {
       return debates.map((d) => {
@@ -35,8 +33,15 @@ function applyEvent(debates, { name, data, ts }) {
     }
     case 'new_argument': {
       return debates.map((d) => {
-        if (d.id !== data.debateId || d.messages.some((m) => m.id === data.message.id)) return d;
-        return { ...d, lastActivity: ts, messages: [...d.messages, { ...data.message, voters: [] }] };
+        if (d.id !== data.debateId) return d;
+        const msg = { ...data.message, voters: [] };
+        if (d.messagesLoaded) {
+          if (d.messages.some((m) => m.id === msg.id)) return d;
+          return { ...d, lastActivity: ts, messageCount: d.messageCount + 1, messages: [...d.messages, msg] };
+        }
+        // Arguments aren't loaded yet for this debate: hold the live ones until they are
+        if (d.pendingMessages.some((m) => m.id === msg.id)) return d;
+        return { ...d, lastActivity: ts, messageCount: d.messageCount + 1, pendingMessages: [...d.pendingMessages, msg] };
       });
     }
     case 'vote_argument': {
@@ -64,16 +69,12 @@ const voteCount = (m) => m.voters.length;
 
 /* ---------- Saved data (Supabase): load everything once at startup ---------- */
 async function loadDebates() {
-  const [d, p, m, v] = await Promise.all([
+  const [d, p, st] = await Promise.all([
     supabase.from('hub_debates').select('*').order('created_at', { ascending: false }),
     supabase.from('hub_participants').select('debate_id, username, joined_at').order('joined_at'),
-    supabase.from('hub_messages').select('*').order('created_at').order('id'),
-    supabase.from('hub_votes').select('message_id, username'),
+    supabase.from('hub_debate_stats').select('debate_id, message_count, last_message_at'),
   ]);
-  [d, p, m, v].forEach((r) => { if (r.error) throw r.error; });
-
-  const votesByMsg = {};
-  v.data.forEach((x) => { (votesByMsg[x.message_id] = votesByMsg[x.message_id] || []).push(x.username); });
+  [d, p, st].forEach((r) => { if (r.error) throw r.error; });
 
   const last = {};
   d.data.forEach((x) => { last[x.id] = Date.parse(x.created_at) || 0; });
@@ -85,12 +86,10 @@ async function loadDebates() {
     bump(x.debate_id, x.joined_at);
   });
 
-  const msgsByDebate = {};
-  m.data.forEach((x) => {
-    (msgsByDebate[x.debate_id] = msgsByDebate[x.debate_id] || []).push({
-      id: x.id, author: x.author, stance: x.stance, text: x.text, voters: votesByMsg[x.id] || [],
-    });
-    bump(x.debate_id, x.created_at);
+  const countByDebate = {};
+  st.data.forEach((x) => {
+    countByDebate[x.debate_id] = x.message_count;
+    bump(x.debate_id, x.last_message_at);
   });
 
   return d.data.map((x) => {
@@ -99,10 +98,28 @@ async function loadDebates() {
       id: x.id, title: x.title, category: x.category, type: x.type, description: x.description, creator: x.creator,
       participants,
       status: x.type === '1v1' && participants.length >= 2 ? 'accepted' : 'open',
-      messages: msgsByDebate[x.id] || [],
+      messages: [],
+      messagesLoaded: false,
+      messageCount: countByDebate[x.id] || 0,
+      pendingMessages: [],
       lastActivity: last[x.id],
     };
   });
+}
+
+// Arguments (with their votes) are loaded only when a debate is opened
+async function loadMessages(debateId) {
+  const { data, error } = await supabase
+    .from('hub_messages')
+    .select('id, author, stance, text, hub_votes(username)')
+    .eq('debate_id', debateId)
+    .order('created_at')
+    .order('id');
+  if (error) throw error;
+  return data.map((x) => ({
+    id: x.id, author: x.author, stance: x.stance, text: x.text,
+    voters: (x.hub_votes || []).map((v) => v.username),
+  }));
 }
 
 /* ---------- Notifications (native on Android, web fallback in browsers) ---------- */
@@ -212,38 +229,71 @@ function DebatePlatform({ username }) {
     if (notifOn) requestNotifPermission();
   }, [notifOn]);
 
-  // Live connection: every event (including our own, echoed back by Ably) updates state
-  const { channel } = useChannel(CHANNEL_NAME, (message) => {
-    const { name, data } = message;
-    const ts = message.timestamp || Date.now();
+  // Live sync: Supabase Realtime broadcast (events) + presence (who is watching what)
+  const [presenceList, setPresenceList] = useState([]);
+  const [subscribed, setSubscribed] = useState(false);
+  const channelRef = useRef(null);
 
-    // Notify participants of activity from the other side (skip replayed history and our own actions)
-    if (data && notifRef.current && Date.now() - ts < 30000) {
-      const d = debatesRef.current.find((x) => x.id === data.debateId);
-      const viewing = document.visibilityState === 'visible' && activeIdRef.current === data.debateId;
-      if (d && d.participants.includes(username) && !viewing) {
-        if (name === 'new_argument' && data.message.author !== username) {
-          notify(d.title, `${data.message.author} (${data.message.stance}): ${data.message.text}`);
-        } else if (name === 'join_debate' && data.user !== username) {
-          notify(d.title, `${data.user} joined the debate`);
+  useEffect(() => {
+    const sessionId = `${username}-${Math.random().toString(36).slice(2, 8)}`;
+    const channel = supabase.channel(CHANNEL_NAME, {
+      config: { broadcast: { self: true }, presence: { key: sessionId } },
+    });
+    channelRef.current = channel;
+
+    channel.on('broadcast', { event: '*' }, ({ event: name, payload: data }) => {
+      const ts = Date.now();
+
+      // Notify participants of activity from the other side (our own actions are skipped)
+      if (data && notifRef.current) {
+        const d = debatesRef.current.find((x) => x.id === data.debateId);
+        const viewing = document.visibilityState === 'visible' && activeIdRef.current === data.debateId;
+        if (d && d.participants.includes(username) && !viewing) {
+          if (name === 'new_argument' && data.message.author !== username) {
+            notify(d.title, `${data.message.author} (${data.message.stance}): ${data.message.text}`);
+          } else if (name === 'join_debate' && data.user !== username) {
+            notify(d.title, `${data.user} joined the debate`);
+          }
         }
       }
-    }
 
-    const evt = { name, data, ts };
-    if (!loadedRef.current) {
-      eventQueue.current.push(evt);
-    } else {
-      setDebates((prev) => applyEvent(prev, evt));
-    }
-  });
+      const evt = { name, data, ts };
+      if (!loadedRef.current) {
+        eventQueue.current.push(evt);
+      } else {
+        setDebates((prev) => applyEvent(prev, evt));
+      }
+    });
 
-  // Presence: who is currently watching which debate
-  const { updateStatus } = usePresence(CHANNEL_NAME, { initialData: { debateId: null } });
-  const { presenceData } = usePresenceListener(CHANNEL_NAME);
+    channel.on('presence', { event: 'sync' }, () => {
+      setPresenceList(Object.values(channel.presenceState()).flat());
+    });
+
+    channel.subscribe((st) => {
+      if (st === 'SUBSCRIBED') {
+        setStatus('online');
+        setSubscribed(true);
+      } else if (st === 'CHANNEL_ERROR' || st === 'TIMED_OUT') {
+        setStatus('error');
+        setSubscribed(false);
+      } else if (st === 'CLOSED') {
+        setStatus('closed');
+        setSubscribed(false);
+      }
+    });
+
+    return () => {
+      supabase.removeChannel(channel);
+      channelRef.current = null;
+      setSubscribed(false);
+    };
+  }, [username]);
+
+  // Tell everyone which debate we're in (or null on the home screen)
   useEffect(() => {
-    try { updateStatus({ debateId: activeDebateId }); } catch { /* not attached yet */ }
-  }, [activeDebateId]); // eslint-disable-line react-hooks/exhaustive-deps
+    const ch = channelRef.current;
+    if (subscribed && ch) ch.track({ user: username, debateId: activeDebateId });
+  }, [activeDebateId, subscribed, username]);
 
   const [now, setNow] = useState(Date.now());
   useEffect(() => {
@@ -252,20 +302,20 @@ function DebatePlatform({ username }) {
   }, []);
 
   const viewers = {};
-  presenceData.forEach((p) => {
+  presenceList.forEach((p) => {
     const id = p.data && p.data.debateId;
     if (id !== null && id !== undefined) viewers[id] = (viewers[id] || 0) + 1;
   });
-  const onlineCount = presenceData.length;
+  const onlineCount = presenceList.length;
   const isLive = (d) => (viewers[d.id] || 0) > 0 || (d.lastActivity && now - d.lastActivity < LIVE_WINDOW_MS);
   const liveDebates = debates.filter(isLive).sort((a, b) => (viewers[b.id] || 0) - (viewers[a.id] || 0));
 
-  useConnectionStateListener((change) => {
-    setStatus(change.current === 'connected' ? 'online' : change.current);
-  });
-
   const publish = (name, data) => {
-    channel.publish(name, data).catch(() => setStatus('error'));
+    const ch = channelRef.current;
+    if (!ch) return;
+    ch.send({ type: 'broadcast', event: name, payload: data }).then((res) => {
+      if (res !== 'ok') setStatus('error');
+    });
   };
 
   const query = searchQuery.trim().toLowerCase();
@@ -282,6 +332,30 @@ function DebatePlatform({ username }) {
   useEffect(() => {
     if (messagesEndRef.current) messagesEndRef.current.scrollIntoView({ block: 'end' });
   }, [messageCount, activeDebateId]);
+
+  // Load this debate's arguments the first time it is opened
+  const fetching = useRef(new Set());
+  useEffect(() => {
+    if (activeDebateId === null || !loaded) return;
+    const target = debatesRef.current.find((d) => d.id === activeDebateId);
+    if (!target || target.messagesLoaded || fetching.current.has(activeDebateId)) return;
+    const id = activeDebateId;
+    fetching.current.add(id);
+    loadMessages(id)
+      .then((rows) => {
+        setDebates((prev) => prev.map((d) => {
+          if (d.id !== id) return d;
+          const have = new Set(rows.map((r) => r.id));
+          const messages = [...rows, ...d.pendingMessages.filter((m) => !have.has(m.id))];
+          return { ...d, messages, messagesLoaded: true, pendingMessages: [], messageCount: messages.length };
+        }));
+      })
+      .catch((err) => {
+        console.error('Load arguments failed:', err);
+        flashError('Could not load the arguments. Go back and open the debate again.');
+      })
+      .finally(() => fetching.current.delete(id));
+  }, [activeDebateId, loaded]);
 
   const getStanceStats = (messages = []) => {
     const pro = messages.filter((m) => m.stance === 'Pro').length;
@@ -382,7 +456,7 @@ function DebatePlatform({ username }) {
   const StatusPill = () => (
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: '11px', fontWeight: 'bold', color: status === 'online' ? '#166534' : '#92400e' }}>
       {status === 'online' ? <Wifi size={12} /> : <WifiOff size={12} />}
-      {status === 'online' ? 'Live' : status === 'connecting' || status === 'initialized' ? 'Connecting…' : 'Reconnecting…'}
+      {status === 'online' ? 'Live' : status === 'connecting' ? 'Connecting…' : 'Reconnecting…'}
     </span>
   );
 
@@ -436,7 +510,9 @@ function DebatePlatform({ username }) {
           </div>
 
           <div style={{ borderTop: '1px solid #e2e8f0', padding: '20px', height: '360px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '12px', backgroundColor: '#fafafa' }}>
-            {activeDebate.messages.length === 0 ? (
+            {!activeDebate.messagesLoaded ? (
+              <p style={{ color: '#94a3b8', textAlign: 'center', margin: 'auto' }}>Loading arguments…</p>
+            ) : activeDebate.messages.length === 0 ? (
               <p style={{ color: '#94a3b8', textAlign: 'center', margin: 'auto' }}>No arguments posted yet. Be the first to start the debate!</p>
             ) : (
               activeDebate.messages.map((msg) => {
@@ -576,7 +652,7 @@ function DebatePlatform({ username }) {
                     <div key={d.id} style={{ flex: '0 0 260px', backgroundColor: 'white', borderRadius: '12px', padding: '14px', border: '1px solid #fecaca', display: 'flex', flexDirection: 'column', gap: 8 }}>
                       <div style={{ fontWeight: 'bold', fontSize: '15px' }}>{d.title}</div>
                       <div style={{ fontSize: '12px', color: '#64748b' }}>
-                        {viewers[d.id] || 0} watching • {d.messages.length} arguments • {d.type}
+                        {viewers[d.id] || 0} watching • {d.messageCount} arguments • {d.type}
                       </div>
                       <div style={{ display: 'flex', gap: 8 }}>
                         <button
@@ -757,20 +833,6 @@ function DebatePlatform({ username }) {
 }
 
 
-/* ---------- Ably wiring ---------- */
-function LiveApp({ username }) {
-  const [client] = useState(() => new Ably.Realtime({ key: ABLY_KEY, clientId: username }));
-  useEffect(() => () => client.close(), [client]);
-
-  return (
-    <AblyProvider client={client}>
-      <ChannelProvider channelName={CHANNEL_NAME} options={{ params: { rewind: '200' } }}>
-        <DebatePlatform username={username} />
-      </ChannelProvider>
-    </AblyProvider>
-  );
-}
-
 export default function App() {
   const [username, setUsername] = useState(() => {
     try { return localStorage.getItem('debatehub:name') || ''; } catch { return ''; }
@@ -784,7 +846,7 @@ export default function App() {
     setUsername(n);
   };
 
-  if (username) return <LiveApp username={username} />;
+  if (username) return <DebatePlatform username={username} />;
 
   return (
     <div style={{ fontFamily: 'system-ui, sans-serif', backgroundColor: '#f8fafc', minHeight: '100vh', padding: '24px', boxSizing: 'border-box', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
