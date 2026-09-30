@@ -3,6 +3,11 @@ import { Users, User, PlusCircle, Search, Send, X, ArrowLeft, ThumbsUp, Wifi, Wi
 import { LocalNotifications } from '@capacitor/local-notifications';
 import * as Ably from 'ably';
 import { AblyProvider, ChannelProvider, useChannel, useConnectionStateListener, usePresence, usePresenceListener } from 'ably/react';
+import { createClient } from '@supabase/supabase-js';
+
+const SUPABASE_URL = 'https://pqwwxmmqumvmjonlreld.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBxd3d4bW1xdW12bWpvbmxyZWxkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA3NTE4MzcsImV4cCI6MjEwNjMyNzgzN30._Lg0q4frcQkj_n83ftvufIWIskC56UcLRg2VvXg56tY';
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const ABLY_KEY = 'N_STWA.0HRHUA:ed6TEW7mZP2xSGvPkkvzsZSuVQW769iX-8C5ale-X68';
 const CHANNEL_NAME = 'debatehub:main';
@@ -11,51 +16,6 @@ const LOGO = `${import.meta.env.BASE_URL}logo.png`;
 const LIVE_WINDOW_MS = 10 * 60 * 1000; // a debate counts as live if active in the last 10 minutes
 
 const CATEGORIES = ['All', 'Politics', 'Technology', 'Science', 'Philosophy', 'Sports'];
-
-const INITIAL_DEBATES = [
-  {
-    id: 1,
-    title: 'Universal Basic Income Implementation',
-    category: 'Politics',
-    type: '1v1',
-    description: 'Should UBI be implemented nationwide to combat automation job losses?',
-    creator: 'Alex M.',
-    participants: ['Alex M.'],
-    status: 'open',
-    messages: [
-      { id: 101, author: 'Alex M.', stance: 'Pro', text: 'Automation will eliminate millions of entry-level jobs. UBI provides an essential safety net.', upvotes: 12, voters: [] },
-      { id: 102, author: 'GuestUser', stance: 'Con', text: 'Universal payments without income thresholds could trigger rapid inflation.', upvotes: 5, voters: [] },
-    ],
-  },
-  {
-    id: 2,
-    title: 'AGI and Future AI Regulation',
-    category: 'Technology',
-    type: 'Group',
-    description: 'Panel discussion on whether AI development should be paused or strictly regulated.',
-    creator: 'Elena R.',
-    participants: ['Elena R.', 'David K.', 'Sarah L.'],
-    status: 'open',
-    messages: [
-      { id: 103, author: 'Elena R.', stance: 'Con', text: 'Strict regulations right now will only slow down beneficial research and innovation.', upvotes: 8, voters: [] },
-      { id: 104, author: 'David K.', stance: 'Pro', text: 'Without guardrails, frontier models pose existential security threats.', upvotes: 15, voters: [] },
-    ],
-  },
-  {
-    id: 3,
-    title: 'Ethics of Space Commercialization',
-    category: 'Science',
-    type: '1v1',
-    description: 'Is private space exploration beneficial or harmful to humanity long-term?',
-    creator: 'Marcus B.',
-    participants: ['Marcus B.', 'John D.'],
-    status: 'accepted',
-    messages: [
-      { id: 105, author: 'Marcus B.', stance: 'Pro', text: 'Commercial competition dramatically lowers launching costs.', upvotes: 4, voters: [] },
-      { id: 106, author: 'John D.', stance: 'Con', text: 'It risks monopolizing space resources for corporate interests.', upvotes: 9, voters: [] },
-    ],
-  },
-];
 
 /* ---------- Shared-state reducer: every device applies the same events ---------- */
 function applyEvent(debates, { name, data, ts }) {
@@ -76,7 +36,7 @@ function applyEvent(debates, { name, data, ts }) {
     case 'new_argument': {
       return debates.map((d) => {
         if (d.id !== data.debateId || d.messages.some((m) => m.id === data.message.id)) return d;
-        return { ...d, lastActivity: ts, messages: [...d.messages, { ...data.message, upvotes: 0, voters: [] }] };
+        return { ...d, lastActivity: ts, messages: [...d.messages, { ...data.message, voters: [] }] };
       });
     }
     case 'vote_argument': {
@@ -100,7 +60,50 @@ function applyEvent(debates, { name, data, ts }) {
   }
 }
 
-const voteCount = (m) => m.upvotes + m.voters.length;
+const voteCount = (m) => m.voters.length;
+
+/* ---------- Saved data (Supabase): load everything once at startup ---------- */
+async function loadDebates() {
+  const [d, p, m, v] = await Promise.all([
+    supabase.from('hub_debates').select('*').order('created_at', { ascending: false }),
+    supabase.from('hub_participants').select('debate_id, username, joined_at').order('joined_at'),
+    supabase.from('hub_messages').select('*').order('created_at').order('id'),
+    supabase.from('hub_votes').select('message_id, username'),
+  ]);
+  [d, p, m, v].forEach((r) => { if (r.error) throw r.error; });
+
+  const votesByMsg = {};
+  v.data.forEach((x) => { (votesByMsg[x.message_id] = votesByMsg[x.message_id] || []).push(x.username); });
+
+  const last = {};
+  d.data.forEach((x) => { last[x.id] = Date.parse(x.created_at) || 0; });
+  const bump = (id, t) => { const n = Date.parse(t) || 0; if (n > (last[id] || 0)) last[id] = n; };
+
+  const partsByDebate = {};
+  p.data.forEach((x) => {
+    (partsByDebate[x.debate_id] = partsByDebate[x.debate_id] || []).push(x.username);
+    bump(x.debate_id, x.joined_at);
+  });
+
+  const msgsByDebate = {};
+  m.data.forEach((x) => {
+    (msgsByDebate[x.debate_id] = msgsByDebate[x.debate_id] || []).push({
+      id: x.id, author: x.author, stance: x.stance, text: x.text, voters: votesByMsg[x.id] || [],
+    });
+    bump(x.debate_id, x.created_at);
+  });
+
+  return d.data.map((x) => {
+    const participants = partsByDebate[x.id] || [x.creator];
+    return {
+      id: x.id, title: x.title, category: x.category, type: x.type, description: x.description, creator: x.creator,
+      participants,
+      status: x.type === '1v1' && participants.length >= 2 ? 'accepted' : 'open',
+      messages: msgsByDebate[x.id] || [],
+      lastActivity: last[x.id],
+    };
+  });
+}
 
 /* ---------- Notifications (native on Android, web fallback in browsers) ---------- */
 let channelReady = false;
@@ -142,7 +145,7 @@ function FacebookLink() {
 function DebatePlatform({ username }) {
   const [status, setStatus] = useState('connecting');
 
-  const [debates, setDebates] = useState(INITIAL_DEBATES);
+  const [debates, setDebates] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [searchQuery, setSearchQuery] = useState('');
   const [activeDebateId, setActiveDebateId] = useState(null);
@@ -159,6 +162,39 @@ function DebatePlatform({ username }) {
   const [chatMessage, setChatMessage] = useState('');
   const [chatStance, setChatStance] = useState('Pro');
   const messagesEndRef = useRef(null);
+
+  // Saved-data loading: live events that arrive before the load finishes are queued, then applied on top
+  const [loaded, setLoaded] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const errTimer = useRef(null);
+  const loadedRef = useRef(false);
+  const eventQueue = useRef([]);
+
+  const flashError = (msg) => {
+    setSaveError(msg);
+    clearTimeout(errTimer.current);
+    errTimer.current = setTimeout(() => setSaveError(''), 6000);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      let base = [];
+      try {
+        base = await loadDebates();
+      } catch (err) {
+        console.error('Load failed:', err);
+        flashError('Could not load saved debates. Showing live updates only.');
+      }
+      if (cancelled) return;
+      const queued = eventQueue.current;
+      eventQueue.current = [];
+      loadedRef.current = true;
+      setDebates(queued.reduce((acc, evt) => applyEvent(acc, evt), base));
+      setLoaded(true);
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   // Refs so the live callback always sees current values
   const debatesRef = useRef(debates);
@@ -194,7 +230,12 @@ function DebatePlatform({ username }) {
       }
     }
 
-    setDebates((prev) => applyEvent(prev, { name, data, ts }));
+    const evt = { name, data, ts };
+    if (!loadedRef.current) {
+      eventQueue.current.push(evt);
+    } else {
+      setDebates((prev) => applyEvent(prev, evt));
+    }
   });
 
   // Presence: who is currently watching which debate
@@ -251,7 +292,25 @@ function DebatePlatform({ username }) {
     return { hasData: true, proPct, conPct: 100 - proPct };
   };
 
-  const handleAcceptDebate = (id) => publish('join_debate', { debateId: id, user: username });
+  const persist = async (query) => {
+    try {
+      const { error } = await query;
+      if (error) throw error;
+    } catch (err) {
+      console.error('Save failed:', err);
+      flashError('Could not save this. Others still see it live, but it may not be there later.');
+    }
+  };
+
+  const handleAcceptDebate = (id) => {
+    publish('join_debate', { debateId: id, user: username });
+    persist(
+      supabase.from('hub_participants').upsert(
+        { debate_id: id, username },
+        { onConflict: 'debate_id,username', ignoreDuplicates: true }
+      )
+    );
+  };
 
   const closeModal = () => { setShowCreateModal(false); setFormError(''); };
 
@@ -260,14 +319,19 @@ function DebatePlatform({ username }) {
       setFormError('Please fill in both the title and description.');
       return;
     }
-    publish('new_debate', {
+    const debateData = {
       id: Date.now() + Math.floor(Math.random() * 1000),
       title: newTitle.trim(),
       category: newCategory,
       type: newType,
       description: newDescription.trim(),
       creator: username,
-    });
+    };
+    publish('new_debate', debateData);
+    (async () => {
+      await persist(supabase.from('hub_debates').insert(debateData));
+      await persist(supabase.from('hub_participants').insert({ debate_id: debateData.id, username }));
+    })();
     closeModal();
     setNewTitle('');
     setNewDescription('');
@@ -275,25 +339,30 @@ function DebatePlatform({ username }) {
 
   const handleSendMessage = () => {
     if (!chatMessage.trim() || !activeDebate || !isJoined) return;
-    publish('new_argument', {
-      debateId: activeDebateId,
-      message: {
-        id: Date.now() + Math.floor(Math.random() * 1000),
-        author: username,
-        stance: chatStance,
-        text: chatMessage.trim(),
-      },
-    });
+    const message = {
+      id: Date.now() + Math.floor(Math.random() * 1000),
+      author: username,
+      stance: chatStance,
+      text: chatMessage.trim(),
+    };
+    publish('new_argument', { debateId: activeDebateId, message });
+    persist(supabase.from('hub_messages').insert({ ...message, debate_id: activeDebateId }));
     setChatMessage('');
   };
 
   const handleUpvote = (msg) => {
-    publish('vote_argument', {
-      debateId: activeDebateId,
-      messageId: msg.id,
-      user: username,
-      on: !msg.voters.includes(username),
-    });
+    const on = !msg.voters.includes(username);
+    publish('vote_argument', { debateId: activeDebateId, messageId: msg.id, user: username, on });
+    if (on) {
+      persist(
+        supabase.from('hub_votes').upsert(
+          { message_id: msg.id, username },
+          { onConflict: 'message_id,username', ignoreDuplicates: true }
+        )
+      );
+    } else {
+      persist(supabase.from('hub_votes').delete().eq('message_id', msg.id).eq('username', username));
+    }
   };
 
   const inputStyle = { padding: '10px', borderRadius: '6px', border: '1px solid #d1d5db', fontFamily: 'inherit', fontSize: '16px', width: '100%', boxSizing: 'border-box' };
@@ -445,7 +514,7 @@ function DebatePlatform({ username }) {
             <div style={{ padding: '16px', borderTop: '1px solid #e2e8f0', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 10, flexWrap: 'wrap', backgroundColor: 'white' }}>
               <span style={{ color: '#64748b', fontSize: '14px' }}>
                 {activeDebate.status === 'accepted'
-                  ? 'This debate is full. You can read and upvote arguments.'
+                  ? 'This debate is full. You can watch and upvote arguments.'
                   : 'Join this debate to post arguments.'}
               </span>
               {activeDebate.status !== 'accepted' && (
@@ -564,7 +633,7 @@ function DebatePlatform({ username }) {
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(320px, 100%), 1fr))', gap: '20px' }}>
             {filteredDebates.length === 0 ? (
               <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '40px', color: '#64748b', backgroundColor: 'white', borderRadius: '8px' }}>
-                No debates match your selection.
+                {loaded ? 'No debates match your selection.' : 'Loading debates…'}
               </div>
             ) : (
               filteredDebates.map((debate) => {
@@ -614,6 +683,15 @@ function DebatePlatform({ username }) {
             )}
           </div>
           <div style={{ textAlign: 'center', marginTop: '32px' }}><FacebookLink /></div>
+        </div>
+      )}
+
+      {saveError && (
+        <div
+          role="alert"
+          style={{ position: 'fixed', left: 16, right: 16, bottom: 'max(16px, env(safe-area-inset-bottom))', backgroundColor: '#7f1d1d', color: 'white', padding: '12px 16px', borderRadius: '8px', fontSize: '14px', zIndex: 60, textAlign: 'center' }}
+        >
+          {saveError}
         </div>
       )}
 
